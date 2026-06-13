@@ -2,18 +2,38 @@ use crate::connections::{Connection, ConnectionSecret, Store};
 use crate::error::{Error, Result};
 use crate::localfs::{self, LocalEntry};
 use crate::logging::{log_error, LogBuilder};
-use crate::remote::{self, Remote};
+use crate::remote::{self, Caps, Remote};
 use crate::s3;
 use crate::session::SessionPool;
 use crate::taxonomy::{Level, Phase};
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
 use uuid::Uuid;
 
+/// A connection plus its capability profile, as the frontend sees it. `caps` is
+/// derived (not persisted) so the UI can key behavior off capabilities instead
+/// of matching on `kind`. The connection's own fields are flattened in, so this
+/// is wire-compatible with the bare `Connection` shape plus a `caps` object.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionView {
+    #[serde(flatten)]
+    connection: Connection,
+    caps: Caps,
+}
+
+impl ConnectionView {
+    fn of(connection: Connection) -> Self {
+        let caps = Caps::for_kind(connection.kind);
+        Self { connection, caps }
+    }
+}
+
 #[tauri::command]
-pub async fn list_connections(store: State<'_, Arc<Store>>) -> Result<Vec<Connection>> {
-    Ok(store.list())
+pub async fn list_connections(store: State<'_, Arc<Store>>) -> Result<Vec<ConnectionView>> {
+    Ok(store.list().into_iter().map(ConnectionView::of).collect())
 }
 
 #[tauri::command]
@@ -22,10 +42,10 @@ pub async fn upsert_connection(
     pool: State<'_, Arc<SessionPool>>,
     connection: Connection,
     secret: Option<ConnectionSecret>,
-) -> Result<Connection> {
+) -> Result<ConnectionView> {
     // Drop any live session so edited host/credentials take effect on reconnect.
     pool.evict(&connection.id).await;
-    store.upsert(connection, secret)
+    store.upsert(connection, secret).map(ConnectionView::of)
 }
 
 #[tauri::command]

@@ -2,7 +2,7 @@ use crate::connections::{Connection, ConnectionKind, ConnectionSecret};
 use crate::error::{AppError, Error, Result};
 use crate::remote::{Caps, Remote};
 use crate::taxonomy::{
-    category_for_http, category_for_s3_code, Connector, ErrorCategory, Level, Phase, StatusCode,
+    category_for_http, category_for_s3_code, ErrorCategory, Level, Phase, StatusCode,
 };
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -69,7 +69,7 @@ pub(crate) fn emit_transfer_error(app: &AppHandle, id: &str, e: &Error) {
 
 /// Project an AWS SDK error onto the [`AppError`] IR: pull the S3 error code and
 /// HTTP status, classify the 3xx/4xx/5xx family, and keep the raw debug as detail.
-pub(crate) fn classify_s3<E>(connector: Connector, phase: Phase, e: &SdkError<E, HttpResponse>) -> Error
+pub(crate) fn classify_s3<E>(connector: ConnectionKind, phase: Phase, e: &SdkError<E, HttpResponse>) -> Error
 where
     E: ProvideErrorMetadata + std::fmt::Debug,
 {
@@ -156,11 +156,7 @@ impl S3Backend {
 #[async_trait]
 impl Remote for S3Backend {
     fn caps(&self) -> Caps {
-        Caps {
-            multipart: true,
-            resume: false,
-            virtual_buckets: true,
-        }
+        Caps::for_kind(self.c.kind)
     }
 
     async fn test(&self) -> Result<String> {
@@ -175,7 +171,7 @@ impl Remote for S3Backend {
                 .max_keys(1)
                 .send()
                 .await
-                .map_err(|e| classify_s3(self.c.kind.into(), Phase::List, &e))?;
+                .map_err(|e| classify_s3(self.c.kind, Phase::List, &e))?;
             return Ok(format!("OK — bucket \"{bucket}\" reachable"));
         }
         let bs = list_buckets(&self.c, &self.s).await?;
@@ -309,7 +305,7 @@ pub async fn make_client(c: &Connection, s: &ConnectionSecret) -> Result<Client>
 
     crate::logging::emit_global(
         Level::Debug,
-        c.kind.into(),
+        c.kind,
         Phase::Connect,
         Some(&c.name),
         format!(
@@ -349,7 +345,7 @@ pub async fn list_buckets(c: &Connection, s: &ConnectionSecret) -> Result<Vec<Bu
         .list_buckets()
         .send()
         .await
-        .map_err(|e| classify_s3(c.kind.into(), Phase::List, &e))?;
+        .map_err(|e| classify_s3(c.kind, Phase::List, &e))?;
     Ok(resp
         .buckets()
         .iter()
@@ -390,7 +386,7 @@ pub async fn list_objects(
         let resp = req
             .send()
             .await
-            .map_err(|e| classify_s3(c.kind.into(), Phase::List, &e))?;
+            .map_err(|e| classify_s3(c.kind, Phase::List, &e))?;
 
         for cp in resp.common_prefixes() {
             if let Some(p) = cp.prefix() {
@@ -466,7 +462,7 @@ pub async fn search_objects(
         let resp = req
             .send()
             .await
-            .map_err(|e| classify_s3(c.kind.into(), Phase::Search, &e))?;
+            .map_err(|e| classify_s3(c.kind, Phase::Search, &e))?;
 
         for obj in resp.contents() {
             let Some(key) = obj.key() else { continue };
@@ -515,7 +511,7 @@ pub async fn delete_object(
         .key(key)
         .send()
         .await
-        .map_err(|e| classify_s3(c.kind.into(), Phase::Delete, &e))?;
+        .map_err(|e| classify_s3(c.kind, Phase::Delete, &e))?;
     Ok(())
 }
 
@@ -528,7 +524,7 @@ pub async fn download(
     dest: &Path,
     transfer_id: String,
 ) -> Result<()> {
-    let connector: Connector = c.kind.into();
+    let connector: ConnectionKind = c.kind;
     let res: Result<()> = async {
         let client = make_client(c, s).await?;
 
@@ -613,7 +609,7 @@ pub async fn upload(
 ) -> Result<()> {
     let client = make_client(c, s).await?;
     let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("upload").to_string();
-    put_file(&client, app, c.kind.into(), bucket, key, src, &name, transfer_id).await
+    put_file(&client, app, c.kind, bucket, key, src, &name, transfer_id).await
 }
 
 /// Upload every file under `files` (abs path, key relative to the upload root)
@@ -627,7 +623,7 @@ pub async fn upload_dir(
     files: &[(std::path::PathBuf, String)],
 ) -> Result<usize> {
     let client = make_client(c, s).await?;
-    let connector: Connector = c.kind.into();
+    let connector: ConnectionKind = c.kind;
     let base = prefix.trim_end_matches('/');
     let mut count = 0;
     for (abs, rel) in files {
@@ -657,7 +653,7 @@ fn part_size_for(total: u64) -> u64 {
 async fn put_file(
     client: &Client,
     app: &AppHandle,
-    connector: Connector,
+    connector: ConnectionKind,
     bucket: &str,
     key: &str,
     src: &Path,
@@ -710,7 +706,7 @@ async fn put_file(
 /// AppHandle-free so it is callable from integration tests.
 async fn put_small(
     client: &Client,
-    connector: Connector,
+    connector: ConnectionKind,
     bucket: &str,
     key: &str,
     src: &Path,
@@ -744,7 +740,7 @@ async fn put_small(
 /// the progress sink — the real app emits a `transfer` event, tests collect).
 async fn put_multipart(
     client: &Client,
-    connector: Connector,
+    connector: ConnectionKind,
     bucket: &str,
     key: &str,
     src: &Path,
@@ -800,7 +796,7 @@ async fn put_multipart(
 
 async fn upload_parts(
     client: &Client,
-    connector: Connector,
+    connector: ConnectionKind,
     bucket: &str,
     key: &str,
     upload_id: &str,
@@ -1037,7 +1033,7 @@ mod r2_live {
         let mut progress: Vec<u64> = Vec::new();
         let res = put_multipart(
             &client,
-            c.kind.into(),
+            c.kind,
             &e.bucket,
             &key,
             &src,

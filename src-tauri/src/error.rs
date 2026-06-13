@@ -10,7 +10,8 @@
 //! `Error` variants below remain for ergonomic `?` conversion and are mapped to
 //! a best-effort `AppError` at serialize time.
 
-use crate::taxonomy::{Connector, ErrorCategory, Phase, StatusCode};
+use crate::connections::ConnectionKind;
+use crate::taxonomy::{ErrorCategory, Phase, StatusCode};
 use serde::{Serialize, Serializer};
 
 /// The structured error surfaced to the UI.
@@ -18,7 +19,7 @@ use serde::{Serialize, Serializer};
 #[serde(rename_all = "camelCase")]
 pub struct AppError {
     pub category: ErrorCategory,
-    pub connector: Option<Connector>,
+    pub connector: Option<ConnectionKind>,
     pub phase: Option<Phase>,
     pub code: Option<StatusCode>,
     pub retryable: bool,
@@ -44,7 +45,7 @@ impl AppError {
         }
     }
 
-    pub fn connector(mut self, c: impl Into<Connector>) -> Self {
+    pub fn connector(mut self, c: impl Into<ConnectionKind>) -> Self {
         self.connector = Some(c.into());
         self
     }
@@ -129,7 +130,7 @@ impl Error {
                     .remediation("Could not read the OS keychain. Re-save the connection's credentials.")
             }
             Error::Tauri(e) => AppError::new(ErrorCategory::Unknown, e.to_string()),
-            Error::S3(s) => AppError::new(ErrorCategory::Unknown, s.clone()).connector(Connector::S3),
+            Error::S3(s) => AppError::new(ErrorCategory::Unknown, s.clone()).connector(ConnectionKind::S3),
             Error::NotFound(s) => AppError::new(ErrorCategory::NotFound, format!("Not found: {s}")),
             Error::Unsupported(s) => AppError::new(ErrorCategory::Client, s.clone()),
             Error::Msg(s) => AppError::new(ErrorCategory::Unknown, s.clone()),

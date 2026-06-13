@@ -1,7 +1,7 @@
 import { motion } from "framer-motion";
 import { Server, Cloud, Plus, Settings, AlertCircle, RefreshCw, Loader2 } from "lucide-react";
 import { Link } from "@tanstack/react-router";
-import { type Connection, KIND_LABEL, isS3Family } from "@/lib/cirrus/types";
+import { type Connection, KIND_LABEL } from "@/lib/cirrus/types";
 import { DebugLogPanel } from "./DebugLogPanel";
 
 type Props = {
@@ -37,8 +37,8 @@ export function Sidebar({
   error,
   onRetry,
 }: Props) {
-  const cloud = connections.filter((c) => isS3Family(c.kind));
-  const servers = connections.filter((c) => !isS3Family(c.kind));
+  const cloud = connections.filter((c) => c.caps?.virtualBuckets);
+  const servers = connections.filter((c) => !c.caps?.virtualBuckets);
   const rowProps = { connectedId, selectedId, connectingId, onSelect, onConnect, onContextMenu };
 
   return (
@@ -136,7 +136,7 @@ function Group({
         const connected = s.id === connectedId;
         const selected = s.id === selectedId;
         const connecting = s.id === connectingId;
-        const Icon = isS3Family(s.kind) ? Cloud : Server;
+        const Icon = s.caps?.virtualBuckets ? Cloud : Server;
         return (
           <button
             key={s.id}

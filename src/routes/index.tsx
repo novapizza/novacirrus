@@ -374,8 +374,9 @@ function Index() {
         let count = 0;
         let skippedFolders = 0;
         for (const f of fs) {
-          // Skip folders for S3 (would need recursive delete); SFTP/FTP delete handles single dirs.
-          if (f.kind === "folder" && isS3Family(active.kind)) {
+          // Skip folders on virtual-bucket backends (S3 folders aren't real and
+          // would need recursive delete); SFTP/FTP delete handles single dirs.
+          if (f.kind === "folder" && active.caps?.virtualBuckets) {
             skippedFolders++;
             continue;
           }
@@ -684,7 +685,7 @@ function joinLocalPath(parts: string[]): string {
 // ----- Path helpers (remote) -----
 
 function initialRemotePath(c: Connection): string {
-  if (isS3Family(c.kind)) {
+  if (c.caps?.virtualBuckets) {
     if (c.bucket && c.defaultPath) {
       return `${c.bucket}/${c.defaultPath.replace(/^\/+/, "")}`;
     }
@@ -696,7 +697,7 @@ function initialRemotePath(c: Connection): string {
 
 function splitRemotePath(c: Connection | null, path: string): string[] {
   if (!c) return [];
-  if (isS3Family(c.kind)) {
+  if (c.caps?.virtualBuckets) {
     if (!path) return ["(buckets)"];
     return path.split("/").filter(Boolean);
   }
@@ -707,7 +708,7 @@ function splitRemotePath(c: Connection | null, path: string): string[] {
 
 function remoteFromSegments(c: Connection | null, segs: string[]): string {
   if (!c) return "";
-  if (isS3Family(c.kind)) {
+  if (c.caps?.virtualBuckets) {
     if (segs.length === 0 || segs[0] === "(buckets)") return "";
     return segs.join("/");
   }
@@ -718,7 +719,7 @@ function remoteFromSegments(c: Connection | null, segs: string[]): string {
 
 function joinRemoteSegment(c: Connection | null, base: string, name: string): string {
   if (!c) return name;
-  if (isS3Family(c.kind)) {
+  if (c.caps?.virtualBuckets) {
     return base ? `${base.replace(/\/$/, "")}/${name}` : name;
   }
   if (!base || base === "/") return `/${name}`;

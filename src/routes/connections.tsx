@@ -75,7 +75,7 @@ function ConnectionsScreen() {
                   </div>
                 )}
                 {items.map((c) => {
-                  const Icon = isS3Family(c.kind) ? Cloud : Server;
+                  const Icon = c.caps?.virtualBuckets ? Cloud : Server;
                   return (
                     <div
                       key={c.id}

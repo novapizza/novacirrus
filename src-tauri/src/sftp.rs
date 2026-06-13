@@ -1,8 +1,8 @@
-use crate::connections::{Connection, ConnectionSecret};
+use crate::connections::{Connection, ConnectionKind, ConnectionSecret};
 use crate::error::{AppError, Error, Result};
 use crate::logging::{self, LogBuilder};
 use crate::remote::{Caps, Remote};
-use crate::taxonomy::{category_for_sftp, Connector, ErrorCategory, Level, Phase};
+use crate::taxonomy::{category_for_sftp, ErrorCategory, Level, Phase};
 use async_trait::async_trait;
 use chrono::DateTime;
 use russh::client;
@@ -26,7 +26,7 @@ fn sftp_err(phase: Phase, e: impl std::fmt::Display) -> Error {
     let category = category_for_sftp(phase, &msg);
     Error::App(
         AppError::new(category, format!("SFTP {phase:?} failed: {msg}"))
-            .connector(Connector::Sftp)
+            .connector(ConnectionKind::Sftp)
             .phase(phase)
             .detail(msg),
     )
@@ -37,7 +37,6 @@ fn sftp_err(phase: Phase, e: impl std::fmt::Display) -> Error {
 /// behind an `Arc` and shared without a mutex. The underlying SSH connection
 /// stays alive as long as this session is.
 pub struct SftpBackend {
-    #[allow(dead_code)] // retained for symmetry / future per-op logging
     pub c: Connection,
     pub sftp: Arc<SftpSession>,
 }
@@ -53,7 +52,7 @@ impl SftpBackend {
 #[async_trait]
 impl Remote for SftpBackend {
     fn caps(&self) -> Caps {
-        Caps { multipart: false, resume: false, virtual_buckets: false }
+        Caps::for_kind(self.c.kind)
     }
 
     async fn test(&self) -> Result<String> {
@@ -218,7 +217,7 @@ impl client::Handler for Handler {
                 }
             };
             LogBuilder::new(level, "connection")
-                .connector(Connector::Sftp)
+                .connector(ConnectionKind::Sftp)
                 .phase(Phase::Handshake)
                 .connection(Some(&self.name))
                 .field("algorithm", algo.clone())
@@ -236,7 +235,7 @@ async fn open(c: &Connection, s: &ConnectionSecret) -> Result<SftpSession> {
     let host = c.host.clone().filter(|s| !s.is_empty()).ok_or_else(|| {
         Error::App(
             AppError::new(ErrorCategory::Config, "SFTP: missing host")
-                .connector(Connector::Sftp)
+                .connector(ConnectionKind::Sftp)
                 .phase(Phase::Config),
         )
     })?;
@@ -244,14 +243,14 @@ async fn open(c: &Connection, s: &ConnectionSecret) -> Result<SftpSession> {
     let user = c.username.clone().filter(|s| !s.is_empty()).ok_or_else(|| {
         Error::App(
             AppError::new(ErrorCategory::Config, "SFTP: missing username")
-                .connector(Connector::Sftp)
+                .connector(ConnectionKind::Sftp)
                 .phase(Phase::Config),
         )
     })?;
 
     logging::emit_global(
         Level::Debug,
-        Connector::Sftp,
+        ConnectionKind::Sftp,
         Phase::Connect,
         Some(&c.name),
         format!("Connecting to {host}:{port}"),
@@ -269,7 +268,7 @@ async fn open(c: &Connection, s: &ConnectionSecret) -> Result<SftpSession> {
                     ErrorCategory::Auth,
                     format!("SFTP host key for {host} has changed"),
                 )
-                .connector(Connector::Sftp)
+                .connector(ConnectionKind::Sftp)
                 .phase(Phase::Handshake)
                 .remediation(
                     "The server presented a different host key than the one previously trusted. \
@@ -289,7 +288,7 @@ async fn open(c: &Connection, s: &ConnectionSecret) -> Result<SftpSession> {
     };
     logging::emit_global(
         Level::Debug,
-        Connector::Sftp,
+        ConnectionKind::Sftp,
         Phase::Auth,
         Some(&c.name),
         format!("Authenticating as {user} ({method})"),
@@ -301,7 +300,7 @@ async fn open(c: &Connection, s: &ConnectionSecret) -> Result<SftpSession> {
             .map_err(|e| {
                 Error::App(
                     AppError::new(ErrorCategory::Auth, format!("SFTP key decode failed: {e}"))
-                        .connector(Connector::Sftp)
+                        .connector(ConnectionKind::Sftp)
                         .phase(Phase::Auth)
                         .remediation("The private key could not be decoded. Check the key format and passphrase.")
                         .detail(format!("{e:?}")),
@@ -327,14 +326,14 @@ async fn open(c: &Connection, s: &ConnectionSecret) -> Result<SftpSession> {
     if !authed.success() {
         return Err(Error::App(
             AppError::new(ErrorCategory::Auth, "SFTP authentication failed")
-                .connector(Connector::Sftp)
+                .connector(ConnectionKind::Sftp)
                 .phase(Phase::Auth)
                 .remediation("Check the username and password / private key for this connection."),
         ));
     }
     logging::emit_global(
         Level::Info,
-        Connector::Sftp,
+        ConnectionKind::Sftp,
         Phase::Auth,
         Some(&c.name),
         format!("Authenticated as {user} ({method})"),
@@ -353,7 +352,7 @@ async fn open(c: &Connection, s: &ConnectionSecret) -> Result<SftpSession> {
         .map_err(|e| sftp_err(Phase::Handshake, e))?;
     logging::emit_global(
         Level::Debug,
-        Connector::Sftp,
+        ConnectionKind::Sftp,
         Phase::Handshake,
         Some(&c.name),
         "SFTP subsystem ready",

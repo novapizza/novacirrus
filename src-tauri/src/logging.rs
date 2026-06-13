@@ -12,8 +12,9 @@
 //! This is intentionally separate from the `transfer` event channel (which drives
 //! the transfer queue UI).
 
+use crate::connections::ConnectionKind;
 use crate::error::Error;
-use crate::taxonomy::{Connector, ErrorCategory, Level, Phase, StatusCode};
+use crate::taxonomy::{ErrorCategory, Level, Phase, StatusCode};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -34,7 +35,7 @@ pub fn app_handle() -> Option<&'static AppHandle> {
 /// [`app_handle`] directly.
 pub fn emit_global(
     level: Level,
-    connector: Connector,
+    connector: ConnectionKind,
     phase: Phase,
     connection: Option<&str>,
     message: impl Into<String>,
@@ -65,11 +66,11 @@ pub fn init_log_bridge(app: AppHandle) {
 /// avoid noise and feedback loops.
 struct ProtocolLogBridge;
 
-fn bridge_target(target: &str) -> Option<Option<Connector>> {
+fn bridge_target(target: &str) -> Option<Option<ConnectionKind>> {
     if target.starts_with("russh") {
-        Some(Some(Connector::Sftp))
+        Some(Some(ConnectionKind::Sftp))
     } else if target.starts_with("suppaftp") {
-        Some(Some(Connector::Ftp))
+        Some(Some(ConnectionKind::Ftp))
     } else if target.starts_with("rustls") {
         Some(None) // TLS lines are shared between FTPS and S3; no single connector
     } else {
@@ -116,7 +117,7 @@ pub struct LogEvent {
     pub level: Level,
     /// Coarse domain: "connection" | "transfer" | …
     pub scope: String,
-    pub connector: Option<Connector>,
+    pub connector: Option<ConnectionKind>,
     pub phase: Option<Phase>,
     pub code: Option<StatusCode>,
     /// Set on error lines so the panel can badge the failure class.
@@ -152,7 +153,7 @@ impl LogBuilder {
         }
     }
 
-    pub fn connector(mut self, c: impl Into<Connector>) -> Self {
+    pub fn connector(mut self, c: impl Into<ConnectionKind>) -> Self {
         self.ev.connector = Some(c.into());
         self
     }

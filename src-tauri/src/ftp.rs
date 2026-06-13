@@ -4,7 +4,7 @@ use crate::logging;
 use crate::remote::{Caps, Remote};
 use crate::s3::{emit_transfer_error, ObjectEntry, TransferEvent};
 use crate::taxonomy::{
-    category_for_ftp, ftp_retryable, Connector, ErrorCategory, Level, Phase, StatusCode,
+    category_for_ftp, ftp_retryable, ErrorCategory, Level, Phase, StatusCode,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 
 /// Project a `suppaftp::FtpError` onto the [`AppError`] IR. The FTP reply code
 /// (e.g. 530, 550) drives the category; `phase` says where we were.
-fn ftp_err(connector: Connector, phase: Phase, e: &FtpError) -> Error {
+fn ftp_err(connector: ConnectionKind, phase: Phase, e: &FtpError) -> Error {
     let (category, code) = match e {
         FtpError::ConnectionError(_) => (ErrorCategory::Network, None),
         FtpError::SecureError(_) => (ErrorCategory::Tls, None),
@@ -68,7 +68,7 @@ impl FtpBackend {
 #[async_trait]
 impl Remote for FtpBackend {
     fn caps(&self) -> Caps {
-        Caps { multipart: false, resume: false, virtual_buckets: false }
+        Caps::for_kind(self.c.kind)
     }
 
     async fn test(&self) -> Result<String> {
@@ -140,7 +140,7 @@ fn log_data_mode(c: &Connection) {
     };
     logging::emit_global(
         Level::Debug,
-        c.kind.into(),
+        c.kind,
         Phase::Passive,
         Some(&c.name),
         format!("Using {mode} mode for data connection"),
@@ -160,7 +160,7 @@ fn rustls_config() -> Arc<rustls::ClientConfig> {
 }
 
 async fn open(c: &Connection, s: &ConnectionSecret) -> Result<AsyncRustlsFtpStream> {
-    let connector: Connector = c.kind.into();
+    let connector: ConnectionKind = c.kind;
     // The UI stores unset optional fields as "" (not null); treat empty as missing.
     let host = c.host.clone().filter(|s| !s.is_empty()).ok_or_else(|| {
         Error::App(
@@ -277,7 +277,7 @@ async fn open(c: &Connection, s: &ConnectionSecret) -> Result<AsyncRustlsFtpStre
 
 /// Probe a live connection (used by the Test button and the pooled `test()`).
 pub async fn check(ftp: &mut AsyncRustlsFtpStream, c: &Connection) -> Result<String> {
-    let connector: Connector = c.kind.into();
+    let connector: ConnectionKind = c.kind;
     let pwd = ftp
         .pwd()
         .await
@@ -290,7 +290,7 @@ pub async fn list(
     c: &Connection,
     path: &str,
 ) -> Result<Vec<ObjectEntry>> {
-    let connector: Connector = c.kind.into();
+    let connector: ConnectionKind = c.kind;
     let target = if path.is_empty() { None } else { Some(path) };
     log_data_mode(c);
     let lines = ftp
@@ -412,7 +412,7 @@ pub async fn download(
     dest: &Path,
     transfer_id: String,
 ) -> Result<()> {
-    let connector: Connector = c.kind.into();
+    let connector: ConnectionKind = c.kind;
     let res: Result<()> = async {
         let total = ftp.size(remote).await.unwrap_or(0) as u64;
 
@@ -479,7 +479,7 @@ pub async fn upload_file(
     remote: &str,
     transfer_id: String,
 ) -> Result<()> {
-    let connector: Connector = c.kind.into();
+    let connector: ConnectionKind = c.kind;
     let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("upload").to_string();
     log_data_mode(c);
     put_file(ftp, app, connector, src, remote, &name, transfer_id).await
@@ -494,7 +494,7 @@ pub async fn upload_dir(
     remote_base: &str,
     files: &[(PathBuf, String)],
 ) -> Result<usize> {
-    let connector: Connector = c.kind.into();
+    let connector: ConnectionKind = c.kind;
     let mut created: HashSet<String> = HashSet::new();
     ensure_dir(ftp, &mut created, remote_base).await;
 
@@ -542,7 +542,7 @@ fn join_remote(base: &str, rel: &str) -> String {
 async fn put_file(
     ftp: &mut AsyncRustlsFtpStream,
     app: &AppHandle,
-    connector: Connector,
+    connector: ConnectionKind,
     src: &Path,
     remote: &str,
     name: &str,
@@ -604,7 +604,7 @@ async fn put_file(
 }
 
 pub async fn delete(ftp: &mut AsyncRustlsFtpStream, c: &Connection, path: &str) -> Result<()> {
-    let connector: Connector = c.kind.into();
+    let connector: ConnectionKind = c.kind;
     if ftp.rm(path).await.is_err() {
         ftp.rmdir(path)
             .await

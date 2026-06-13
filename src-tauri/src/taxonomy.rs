@@ -1,8 +1,10 @@
 //! Shared classification vocabulary (the "IR") for errors and logs.
 //!
-//! Both [`crate::error::AppError`] and (later) the structured log event draw their
-//! `connector` / `phase` / `category` / `code` fields from the enums here, so the
-//! UI can filter and badge by stable machine values instead of parsing prose.
+//! Both [`crate::error::AppError`] and the structured log event draw their
+//! `phase` / `category` / `code` fields from the enums here, so the UI can
+//! filter and badge by stable machine values instead of parsing prose. The
+//! `connector` axis reuses [`crate::connections::ConnectionKind`] directly —
+//! there is no separate connector enum to keep in sync.
 //!
 //! To teach the app a new failure shape you extend *one* enum + its classifier
 //! here; every connector and the frontend inherit it.
@@ -13,7 +15,6 @@
 // log IR (#3). They are not dead code — they are the API surface.
 #![allow(dead_code)]
 
-use crate::connections::ConnectionKind;
 use serde::Serialize;
 
 /// Severity. Mirrors the frontend `LogLevel`.
@@ -33,32 +34,6 @@ impl Level {
             Level::Info => "info",
             Level::Warn => "warn",
             Level::Error => "error",
-        }
-    }
-}
-
-/// Which backend produced an event. Distinct from [`ConnectionKind`] so the
-/// taxonomy stays usable even if connection modelling changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Connector {
-    S3,
-    R2,
-    S3Compat,
-    Sftp,
-    Ftp,
-    Ftps,
-}
-
-impl From<ConnectionKind> for Connector {
-    fn from(k: ConnectionKind) -> Self {
-        match k {
-            ConnectionKind::S3 => Connector::S3,
-            ConnectionKind::R2 => Connector::R2,
-            ConnectionKind::S3Compat => Connector::S3Compat,
-            ConnectionKind::Sftp => Connector::Sftp,
-            ConnectionKind::Ftp => Connector::Ftp,
-            ConnectionKind::Ftps => Connector::Ftps,
         }
     }
 }

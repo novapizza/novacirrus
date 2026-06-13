@@ -14,15 +14,16 @@ use crate::error::Result;
 use crate::s3::ObjectEntry;
 use crate::{ftp, s3, sftp};
 use async_trait::async_trait;
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::AppHandle;
 
 /// What a backend can do, so the dispatcher / UI can adapt instead of
-/// hard-coding "is this the S3 family?". Extended as features land (e.g. #5
-/// flips `multipart` on for S3). Not yet consumed — capability surface only.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
+/// hard-coding "is this the S3 family?". Serialized to the frontend (attached to
+/// each connection) so the UI keys behavior off capabilities rather than kind.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Caps {
     /// Supports chunked/multipart uploads (resumable per-part, no whole-file buffer).
     pub multipart: bool,
@@ -32,11 +33,36 @@ pub struct Caps {
     pub virtual_buckets: bool,
 }
 
+impl Caps {
+    /// The capability profile for a connection kind — the single source of truth.
+    /// Derived from `kind` alone so the UI can know caps without opening a
+    /// session (sidebar grouping/icons render before any Connect). `Remote::caps`
+    /// delegates here; the `connection_*` commands attach the result to each
+    /// connection they return.
+    pub const fn for_kind(kind: ConnectionKind) -> Self {
+        match kind {
+            ConnectionKind::S3 | ConnectionKind::R2 | ConnectionKind::S3Compat => Caps {
+                multipart: true,
+                resume: false,
+                virtual_buckets: true,
+            },
+            ConnectionKind::Sftp | ConnectionKind::Ftp | ConnectionKind::Ftps => Caps {
+                multipart: false,
+                resume: false,
+                virtual_buckets: false,
+            },
+        }
+    }
+}
+
 /// The capability surface every connector implements. One trait, one factory —
 /// no per-operation `match c.kind`.
 #[async_trait]
 pub trait Remote: Send + Sync {
-    #[allow(dead_code)] // capability surface; consumed by UI / #5
+    /// This backend's capability profile. Per-instance surface; the default
+    /// derives from the connection kind via [`Caps::for_kind`], which is also
+    /// what the UI receives. Override only if an instance differs from its kind.
+    #[allow(dead_code)] // per-instance surface; the UI path goes through Caps::for_kind
     fn caps(&self) -> Caps;
 
     /// Verify the remote is reachable; returns a short human status string.

@@ -15,6 +15,14 @@ export const isS3Family = (k: ConnectionKind) => S3_KINDS.includes(k);
 /** FTP/FTPS data-channel mode (mirrors the Rust `FtpMode`). */
 export type FtpMode = "active" | "passive" | "extended-passive";
 
+/** What a backend can do. Mirrors the Rust `Caps`; derived from `kind` server-side.
+ *  Prefer keying UI behavior off these over checking the connection kind. */
+export type Caps = {
+  multipart: boolean;
+  resume: boolean;
+  virtualBuckets: boolean;
+};
+
 export type Connection = {
   id: string;
   name: string;
@@ -31,6 +39,9 @@ export type Connection = {
   ftpsImplicit?: boolean;
   color: string;
   createdAt?: string | null;
+  /** Capability profile from the backend. Present on connections returned by
+   *  `list`/`upsert`; absent on unsaved drafts built in the UI. */
+  caps?: Caps;
 };
 
 export type ConnectionSecret = {
