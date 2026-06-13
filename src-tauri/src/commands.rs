@@ -2,8 +2,9 @@ use crate::connections::{Connection, ConnectionSecret, Store};
 use crate::error::{Error, Result};
 use crate::localfs::{self, LocalEntry};
 use crate::logging::{log_error, LogBuilder};
-use crate::remote;
+use crate::remote::{self, Remote};
 use crate::s3;
+use crate::session::SessionPool;
 use crate::taxonomy::{Level, Phase};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,17 +19,22 @@ pub async fn list_connections(store: State<'_, Arc<Store>>) -> Result<Vec<Connec
 #[tauri::command]
 pub async fn upsert_connection(
     store: State<'_, Arc<Store>>,
+    pool: State<'_, Arc<SessionPool>>,
     connection: Connection,
     secret: Option<ConnectionSecret>,
 ) -> Result<Connection> {
+    // Drop any live session so edited host/credentials take effect on reconnect.
+    pool.evict(&connection.id).await;
     store.upsert(connection, secret)
 }
 
 #[tauri::command]
 pub async fn delete_connection(
     store: State<'_, Arc<Store>>,
+    pool: State<'_, Arc<SessionPool>>,
     id: String,
 ) -> Result<()> {
+    pool.disconnect(&id).await; // close any live session before the config is gone
     store.delete(&id)
 }
 
@@ -64,6 +70,67 @@ pub async fn test_connection(
     }
 }
 
+/// Open and pool a live session (the explicit "Connect" action). The handshake
+/// — and any auth / host-key failure — happens here, so the UI can show a
+/// connecting state and surface errors before showing the remote as connected.
+#[tauri::command]
+pub async fn connect(
+    app: AppHandle,
+    store: State<'_, Arc<Store>>,
+    pool: State<'_, Arc<SessionPool>>,
+    id: String,
+) -> Result<()> {
+    let c = store.get(&id).ok_or_else(|| Error::NotFound(id.clone()))?;
+    let s = store.read_secret(&id)?;
+    LogBuilder::new(Level::Info, "connection")
+        .connector(c.kind)
+        .phase(Phase::Connect)
+        .connection(Some(&c.name))
+        .message("Connecting")
+        .emit(&app);
+    match pool.connect(&c, &s).await {
+        Ok(()) => {
+            LogBuilder::new(Level::Info, "connection")
+                .connector(c.kind)
+                .phase(Phase::Connect)
+                .connection(Some(&c.name))
+                .message("Connected")
+                .emit(&app);
+            Ok(())
+        }
+        Err(e) => {
+            log_error(&app, "connection", Some(&c.name), "Connect failed", &e);
+            Err(e)
+        }
+    }
+}
+
+/// Close a pooled session (the explicit "Disconnect" action). Idempotent.
+#[tauri::command]
+pub async fn disconnect(
+    app: AppHandle,
+    store: State<'_, Arc<Store>>,
+    pool: State<'_, Arc<SessionPool>>,
+    id: String,
+) -> Result<()> {
+    pool.disconnect(&id).await;
+    if let Some(c) = store.get(&id) {
+        LogBuilder::new(Level::Info, "connection")
+            .connector(c.kind)
+            .phase(Phase::Connect)
+            .connection(Some(&c.name))
+            .message("Disconnected")
+            .emit(&app);
+    }
+    Ok(())
+}
+
+/// Whether a connection currently has a live pooled session.
+#[tauri::command]
+pub async fn is_connected(pool: State<'_, Arc<SessionPool>>, id: String) -> Result<bool> {
+    Ok(pool.is_connected(&id).await)
+}
+
 /// Short, log-friendly form of a path: its last segment (or "/" for the root).
 fn display_path(p: &str) -> String {
     let trimmed = p.trim_end_matches('/');
@@ -79,6 +146,7 @@ fn display_path(p: &str) -> String {
 pub async fn remote_list(
     app: AppHandle,
     store: State<'_, Arc<Store>>,
+    pool: State<'_, Arc<SessionPool>>,
     connection_id: String,
     path: String,
 ) -> Result<Vec<s3::ObjectEntry>> {
@@ -90,7 +158,8 @@ pub async fn remote_list(
         .connection(Some(&c.name))
         .message(format!("List {}", display_path(&path)))
         .emit(&app);
-    match remote::list(&c, &s, &path).await {
+    let backend = resolve_backend(&app, &pool, &c, &s).await?;
+    match backend.list(&path).await {
         Ok(v) => {
             LogBuilder::new(Level::Debug, "connection")
                 .connector(c.kind)
@@ -102,16 +171,32 @@ pub async fn remote_list(
             Ok(v)
         }
         Err(e) => {
+            pool.note_op_error(&app, &connection_id, &e).await;
             log_error(&app, "connection", Some(&c.name), "List failed", &e);
             Err(e)
         }
     }
 }
 
+/// Resolve the live pooled backend for `c`, logging a connect failure. Shared by
+/// the remote_* commands so a dropped session reconnects transparently on use.
+async fn resolve_backend(
+    app: &AppHandle,
+    pool: &SessionPool,
+    c: &Connection,
+    s: &ConnectionSecret,
+) -> Result<Arc<dyn Remote>> {
+    pool.get_or_connect(c, s).await.map_err(|e| {
+        log_error(app, "connection", Some(&c.name), "Connect failed", &e);
+        e
+    })
+}
+
 #[tauri::command]
 pub async fn remote_search(
     app: AppHandle,
     store: State<'_, Arc<Store>>,
+    pool: State<'_, Arc<SessionPool>>,
     connection_id: String,
     path: String,
     query: String,
@@ -124,7 +209,8 @@ pub async fn remote_search(
         .connection(Some(&c.name))
         .message(format!("Search \"{query}\" in {}", display_path(&path)))
         .emit(&app);
-    match remote::search(&c, &s, &path, &query).await {
+    let backend = resolve_backend(&app, &pool, &c, &s).await?;
+    match remote::search(backend.as_ref(), &path, &query).await {
         Ok(v) => {
             LogBuilder::new(Level::Info, "connection")
                 .connector(c.kind)
@@ -136,6 +222,7 @@ pub async fn remote_search(
             Ok(v)
         }
         Err(e) => {
+            pool.note_op_error(&app, &connection_id, &e).await;
             log_error(&app, "connection", Some(&c.name), "Search failed", &e);
             Err(e)
         }
@@ -146,6 +233,7 @@ pub async fn remote_search(
 pub async fn remote_download(
     app: AppHandle,
     store: State<'_, Arc<Store>>,
+    pool: State<'_, Arc<SessionPool>>,
     connection_id: String,
     path: String,
     dest: String,
@@ -159,7 +247,8 @@ pub async fn remote_download(
         .connection(Some(&c.name))
         .message(format!("Download {}", display_path(&path)))
         .emit(&app);
-    match remote::download(&app, &c, &s, &path, PathBuf::from(dest).as_path(), id.clone()).await {
+    let backend = resolve_backend(&app, &pool, &c, &s).await?;
+    match backend.download(&app, &path, PathBuf::from(dest).as_path(), id.clone()).await {
         Ok(()) => {
             LogBuilder::new(Level::Info, "transfer")
                 .connector(c.kind)
@@ -170,6 +259,7 @@ pub async fn remote_download(
             Ok(id)
         }
         Err(e) => {
+            pool.note_op_error(&app, &connection_id, &e).await;
             log_error(&app, "transfer", Some(&c.name), "Download failed", &e);
             Err(e)
         }
@@ -180,6 +270,7 @@ pub async fn remote_download(
 pub async fn remote_upload(
     app: AppHandle,
     store: State<'_, Arc<Store>>,
+    pool: State<'_, Arc<SessionPool>>,
     connection_id: String,
     src: String,
     path: String,
@@ -194,7 +285,8 @@ pub async fn remote_upload(
         .connection(Some(&c.name))
         .message(format!("Upload {name}"))
         .emit(&app);
-    match remote::upload(&app, &c, &s, PathBuf::from(&src).as_path(), &path, id.clone()).await {
+    let backend = resolve_backend(&app, &pool, &c, &s).await?;
+    match remote::upload(backend.as_ref(), &app, PathBuf::from(&src).as_path(), &path, id.clone()).await {
         Ok(()) => {
             LogBuilder::new(Level::Info, "transfer")
                 .connector(c.kind)
@@ -205,6 +297,7 @@ pub async fn remote_upload(
             Ok(id)
         }
         Err(e) => {
+            pool.note_op_error(&app, &connection_id, &e).await;
             log_error(&app, "transfer", Some(&c.name), "Upload failed", &e);
             Err(e)
         }
@@ -215,6 +308,7 @@ pub async fn remote_upload(
 pub async fn remote_delete(
     app: AppHandle,
     store: State<'_, Arc<Store>>,
+    pool: State<'_, Arc<SessionPool>>,
     connection_id: String,
     path: String,
 ) -> Result<()> {
@@ -226,9 +320,11 @@ pub async fn remote_delete(
         .connection(Some(&c.name))
         .message(format!("Delete {}", display_path(&path)))
         .emit(&app);
-    match remote::delete(&c, &s, &path).await {
+    let backend = resolve_backend(&app, &pool, &c, &s).await?;
+    match backend.delete(&path).await {
         Ok(()) => Ok(()),
         Err(e) => {
+            pool.note_op_error(&app, &connection_id, &e).await;
             log_error(&app, "connection", Some(&c.name), "Delete failed", &e);
             Err(e)
         }

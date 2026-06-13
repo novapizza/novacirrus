@@ -14,6 +14,13 @@ export const api = {
   deleteConnection: (id: string) => invoke<void>("delete_connection", { id }),
   testConnection: (id: string) => invoke<string>("test_connection", { id }),
 
+  /** Open and pool a live session (explicit Connect). Rejects on auth/host-key/network failure. */
+  connect: (id: string) => invoke<void>("connect", { id }),
+  /** Close the pooled session (explicit Disconnect). Idempotent. */
+  disconnect: (id: string) => invoke<void>("disconnect", { id }),
+  /** Whether a connection currently has a live pooled session. */
+  isConnected: (id: string) => invoke<boolean>("is_connected", { id }),
+
   remoteList: (connectionId: string, path: string) =>
     invoke<ObjectEntry[]>("remote_list", { connectionId, path }),
   remoteSearch: (connectionId: string, path: string, query: string) =>

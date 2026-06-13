@@ -2,6 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { save as saveDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { listen } from "@tauri-apps/api/event";
 import { PanelGroup, Panel } from "react-resizable-panels";
 import { TitleBar } from "@/components/cirrus/TitleBar";
 import { Sidebar } from "@/components/cirrus/Sidebar";
@@ -13,7 +14,7 @@ import { VHandle, HHandle } from "@/components/cirrus/Resize";
 import { ConfirmDialog } from "@/components/cirrus/ConfirmDialog";
 import { ContextMenu } from "@/components/cirrus/ContextMenu";
 import { SettingsSheet, useSettings } from "@/components/cirrus/SettingsSheet";
-import { FileUp, FolderUp } from "lucide-react";
+import { FileUp, FolderUp, Plug, Unplug } from "lucide-react";
 import type { FileNode } from "@/lib/cirrus/types";
 import { useConnections } from "@/hooks/use-connections";
 import { useShortcuts } from "@/hooks/use-shortcut";
@@ -37,7 +38,14 @@ type Side = "local" | "remote";
 function Index() {
   const { items: connections, refresh, loading: connectionsLoading, error: connectionsError } = useConnections();
 
+  // `activeId` = the connected session (drives the remote pane). `selectedId` =
+  // the merely-highlighted row. Single click selects; an explicit Connect
+  // (double-click / context menu) is what opens a session — so clicking around
+  // the sidebar never reconnects, and switching selection never disconnects.
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [connectingId, setConnectingId] = useState<string | null>(null);
+  const [connMenu, setConnMenu] = useState<{ c: Connection; x: number; y: number } | null>(null);
   const [connectOpen, setConnectOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [confirm, setConfirm] = useState<{
@@ -78,6 +86,51 @@ function Index() {
     () => connections.find((c) => c.id === activeId) ?? null,
     [activeId, connections],
   );
+
+  // Single click: highlight only — no network, no disconnect of the current session.
+  const selectConnection = useCallback((c: Connection) => setSelectedId(c.id), []);
+  // Explicit connect (double-click / context menu): open and pool the live
+  // session, then show it as active. Auth/host-key/network errors surface here
+  // instead of failing silently on the first list.
+  const connectConnection = useCallback(async (c: Connection) => {
+    setSelectedId(c.id);
+    if (c.id === activeId) {
+      // Reconnect: drop the stale session first so connect() opens a fresh one.
+      await api.disconnect(c.id).catch(() => {});
+      setActiveId(null);
+    }
+    setConnectingId(c.id);
+    try {
+      await api.connect(c.id);
+      setActiveId(c.id);
+    } catch (e) {
+      toast.error("Couldn’t connect", errText(e));
+    } finally {
+      setConnectingId((id) => (id === c.id ? null : id));
+    }
+  }, [activeId]);
+  const disconnectConnection = useCallback(async () => {
+    const id = activeId;
+    setActiveId(null);
+    if (id) await api.disconnect(id).catch(() => {});
+  }, [activeId]);
+
+  // The server (or a network drop) can close a pooled session mid-use; the
+  // backend evicts it and emits `disconnected`. Clear the active connection so
+  // the UI matches reality rather than showing a dead session as connected.
+  useEffect(() => {
+    const un = listen<{ id: string; reason: string }>("disconnected", (e) => {
+      setConnectingId((id) => (id === e.payload.id ? null : id));
+      setActiveId((cur) => {
+        if (cur !== e.payload.id) return cur;
+        toast.info("Disconnected", e.payload.reason || "The server closed the connection.");
+        return null;
+      });
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
 
   useEffect(() => {
     if (localCwd) return;
@@ -421,7 +474,7 @@ function Index() {
             ? `${active.username ?? ""}${active.username ? "@" : ""}${active.host ?? active.endpoint ?? ""}`
             : undefined
         }
-        onDisconnect={active ? () => setActiveId(null) : undefined}
+        onDisconnect={active ? disconnectConnection : undefined}
         onRefresh={() => {
           refreshLocal();
           refreshRemote();
@@ -443,8 +496,12 @@ function Index() {
         <Panel defaultSize={20} minSize={14} maxSize={45}>
           <Sidebar
             connections={connections}
-            activeId={activeId}
-            onSelect={(c) => setActiveId((prev) => (prev === c.id ? null : c.id))}
+            connectedId={activeId}
+            selectedId={selectedId}
+            connectingId={connectingId}
+            onSelect={selectConnection}
+            onConnect={connectConnection}
+            onContextMenu={(c, x, y) => setConnMenu({ c, x, y })}
             onNewConnection={() => setConnectOpen(true)}
             loading={connectionsLoading}
             error={connectionsError}
@@ -509,6 +566,7 @@ function Index() {
         onClose={() => setConnectOpen(false)}
         onSaved={async (c) => {
           await refresh();
+          setSelectedId(c.id);
           setActiveId(c.id);
           setConnectOpen(false);
           toast.success("Connection saved", c.name);
@@ -533,6 +591,41 @@ function Index() {
         danger
         onConfirm={() => confirm?.onConfirm()}
         onCancel={() => setConfirm(null)}
+      />
+
+      <ContextMenu
+        open={!!connMenu}
+        x={connMenu?.x ?? 0}
+        y={connMenu?.y ?? 0}
+        items={
+          connMenu
+            ? connMenu.c.id === activeId
+              ? [
+                  {
+                    type: "item",
+                    label: "Reconnect",
+                    icon: <Plug className="h-3.5 w-3.5" />,
+                    onClick: () => connectConnection(connMenu.c),
+                  },
+                  {
+                    type: "item",
+                    label: "Disconnect",
+                    icon: <Unplug className="h-3.5 w-3.5" />,
+                    danger: true,
+                    onClick: disconnectConnection,
+                  },
+                ]
+              : [
+                  {
+                    type: "item",
+                    label: "Connect",
+                    icon: <Plug className="h-3.5 w-3.5" />,
+                    onClick: () => connectConnection(connMenu.c),
+                  },
+                ]
+            : []
+        }
+        onClose={() => setConnMenu(null)}
       />
 
       <ContextMenu

@@ -32,24 +32,36 @@ fn sftp_err(phase: Phase, e: impl std::fmt::Display) -> Error {
     )
 }
 
-/// SFTP backend. A session is opened per operation for now.
-pub struct SftpBackend<'a> {
-    pub c: &'a Connection,
-    pub s: &'a ConnectionSecret,
+/// SFTP backend over a single live session, reused across operations. The
+/// `SftpSession` multiplexes concurrent requests over one channel, so it's held
+/// behind an `Arc` and shared without a mutex. The underlying SSH connection
+/// stays alive as long as this session is.
+pub struct SftpBackend {
+    #[allow(dead_code)] // retained for symmetry / future per-op logging
+    pub c: Connection,
+    pub sftp: Arc<SftpSession>,
+}
+
+impl SftpBackend {
+    /// Open and authenticate a session — the expensive SSH handshake happens here.
+    pub async fn connect(c: &Connection, s: &ConnectionSecret) -> Result<Self> {
+        let sftp = open(c, s).await?;
+        Ok(Self { c: c.clone(), sftp: Arc::new(sftp) })
+    }
 }
 
 #[async_trait]
-impl Remote for SftpBackend<'_> {
+impl Remote for SftpBackend {
     fn caps(&self) -> Caps {
         Caps { multipart: false, resume: false, virtual_buckets: false }
     }
 
     async fn test(&self) -> Result<String> {
-        test(self.c, self.s).await
+        check(&self.sftp).await
     }
 
     async fn list(&self, path: &str) -> Result<Vec<ObjectEntry>> {
-        list(self.c, self.s, path).await
+        list(&self.sftp, path).await
     }
 
     async fn search(
@@ -59,7 +71,7 @@ impl Remote for SftpBackend<'_> {
         limit: usize,
         max_depth: usize,
     ) -> Result<Vec<ObjectEntry>> {
-        search(self.c, self.s, path, query, limit, max_depth).await
+        search(&self.sftp, path, query, limit, max_depth).await
     }
 
     async fn download(
@@ -69,7 +81,7 @@ impl Remote for SftpBackend<'_> {
         dest: &Path,
         transfer_id: String,
     ) -> Result<()> {
-        download(app, self.c, self.s, remote, dest, transfer_id).await
+        download(&self.sftp, app, remote, dest, transfer_id).await
     }
 
     async fn upload_file(
@@ -79,7 +91,7 @@ impl Remote for SftpBackend<'_> {
         remote: &str,
         transfer_id: String,
     ) -> Result<()> {
-        upload(app, self.c, self.s, src, remote, transfer_id).await
+        upload_file(&self.sftp, app, src, remote, transfer_id).await
     }
 
     async fn upload_dir(
@@ -88,11 +100,11 @@ impl Remote for SftpBackend<'_> {
         remote_base: &str,
         files: &[(PathBuf, String)],
     ) -> Result<usize> {
-        upload_dir(app, self.c, self.s, remote_base, files).await
+        upload_dir(&self.sftp, app, remote_base, files).await
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
-        delete(self.c, self.s, path).await
+        delete(&self.sftp, path).await
     }
 }
 
@@ -349,14 +361,13 @@ async fn open(c: &Connection, s: &ConnectionSecret) -> Result<SftpSession> {
     Ok(sftp)
 }
 
-pub async fn test(c: &Connection, s: &ConnectionSecret) -> Result<String> {
-    let sftp = open(c, s).await?;
+/// Probe a live session (used by the Test button and the pooled `test()`).
+pub async fn check(sftp: &SftpSession) -> Result<String> {
     let cwd = sftp.canonicalize(".").await.unwrap_or_else(|_| "/".into());
     Ok(format!("OK — connected, cwd={cwd}"))
 }
 
-pub async fn list(c: &Connection, s: &ConnectionSecret, path: &str) -> Result<Vec<ObjectEntry>> {
-    let sftp = open(c, s).await?;
+pub async fn list(sftp: &SftpSession, path: &str) -> Result<Vec<ObjectEntry>> {
     let path = if path.is_empty() { "." } else { path };
     let entries = sftp
         .read_dir(path)
@@ -403,14 +414,12 @@ pub async fn list(c: &Connection, s: &ConnectionSecret, path: &str) -> Result<Ve
 /// (case-insensitive). `name` is the path relative to `root`. Bounded by
 /// `max_depth` levels and `limit` results to keep slow links responsive.
 pub async fn search(
-    c: &Connection,
-    s: &ConnectionSecret,
+    sftp: &SftpSession,
     root: &str,
     query: &str,
     limit: usize,
     max_depth: usize,
 ) -> Result<Vec<ObjectEntry>> {
-    let sftp = open(c, s).await?;
     let needle = query.to_lowercase();
     let start_abs = if root.is_empty() { ".".to_string() } else { root.to_string() };
 
@@ -469,15 +478,13 @@ pub async fn search(
 }
 
 pub async fn download(
+    sftp: &SftpSession,
     app: &AppHandle,
-    c: &Connection,
-    s: &ConnectionSecret,
     remote: &str,
     dest: &Path,
     transfer_id: String,
 ) -> Result<()> {
     let res: Result<()> = async {
-        let sftp = open(c, s).await?;
         let meta = sftp
             .metadata(remote)
             .await
@@ -532,41 +539,37 @@ pub async fn download(
     res
 }
 
-pub async fn upload(
+pub async fn upload_file(
+    sftp: &SftpSession,
     app: &AppHandle,
-    c: &Connection,
-    s: &ConnectionSecret,
     src: &Path,
     remote: &str,
     transfer_id: String,
 ) -> Result<()> {
-    let sftp = open(c, s).await?;
     let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("upload").to_string();
-    put_file(&sftp, app, src, remote, &name, transfer_id).await
+    put_file(sftp, app, src, remote, &name, transfer_id).await
 }
 
 /// Upload every file under `files` (abs path, path relative to the upload root)
 /// into `remote_base`, reusing one session and creating remote dirs as needed.
 pub async fn upload_dir(
+    sftp: &SftpSession,
     app: &AppHandle,
-    c: &Connection,
-    s: &ConnectionSecret,
     remote_base: &str,
     files: &[(PathBuf, String)],
 ) -> Result<usize> {
-    let sftp = open(c, s).await?;
     let mut created: HashSet<String> = HashSet::new();
-    ensure_dir(&sftp, &mut created, remote_base).await;
+    ensure_dir(sftp, &mut created, remote_base).await;
 
     let mut count = 0;
     for (abs, rel) in files {
         let remote = join_remote(remote_base, rel);
         if let Some((parent, _)) = remote.rsplit_once('/') {
             if !parent.is_empty() {
-                ensure_dir(&sftp, &mut created, parent).await;
+                ensure_dir(sftp, &mut created, parent).await;
             }
         }
-        put_file(&sftp, app, abs, &remote, rel, Uuid::new_v4().to_string()).await?;
+        put_file(sftp, app, abs, &remote, rel, Uuid::new_v4().to_string()).await?;
         count += 1;
     }
     Ok(count)
@@ -656,8 +659,7 @@ async fn put_file(
     res
 }
 
-pub async fn delete(c: &Connection, s: &ConnectionSecret, path: &str) -> Result<()> {
-    let sftp = open(c, s).await?;
+pub async fn delete(sftp: &SftpSession, path: &str) -> Result<()> {
     let meta = sftp
         .metadata(path)
         .await
@@ -711,9 +713,10 @@ mod live {
     async fn connect_and_list() {
         let c = conn("demo");
         let s = pw("password");
-        let msg = test(&c, &s).await.expect("connect should succeed");
+        let b = SftpBackend::connect(&c, &s).await.expect("connect should succeed");
+        let msg = b.test().await.expect("probe should succeed");
         assert!(msg.contains("OK"), "unexpected: {msg}");
-        let entries = list(&c, &s, "").await.expect("list should succeed");
+        let entries = b.list("").await.expect("list should succeed");
         assert!(!entries.is_empty(), "home should not be empty");
         assert!(
             entries.iter().any(|e| e.name.to_lowercase().contains("readme")),
@@ -725,7 +728,10 @@ mod live {
     #[tokio::test]
     #[ignore = "hits public test.rebex.net"]
     async fn wrong_password_is_auth() {
-        let err = test(&conn("demo"), &pw("definitely-wrong")).await.unwrap_err();
+        let err = SftpBackend::connect(&conn("demo"), &pw("definitely-wrong"))
+            .await
+            .err()
+            .expect("auth should fail");
         let a = err.to_app();
         assert_eq!(a.category, ErrorCategory::Auth, "got {a:?}");
     }
@@ -733,9 +739,10 @@ mod live {
     #[tokio::test]
     #[ignore = "hits public test.rebex.net"]
     async fn missing_path_is_classified() {
-        let err = list(&conn("demo"), &pw("password"), "/no/such/dir/zzz")
+        let b = SftpBackend::connect(&conn("demo"), &pw("password"))
             .await
-            .unwrap_err();
+            .expect("connect should succeed");
+        let err = b.list("/no/such/dir/zzz").await.unwrap_err();
         let a = err.to_app();
         // Should be a clean, classified error — not Unknown.
         assert!(

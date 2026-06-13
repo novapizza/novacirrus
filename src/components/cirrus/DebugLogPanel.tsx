@@ -1,6 +1,9 @@
 import { useMemo, useState } from "react";
-import { Bug, Trash2, ChevronDown } from "lucide-react";
+import { Bug, Trash2, ChevronDown, Copy, Check } from "lucide-react";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { useLogs, clearLogs, LEVEL_RANK } from "@/lib/cirrus/logs";
+import { toast } from "@/lib/cirrus/toast";
+import { errText } from "@/lib/cirrus/errors";
 import type { LogEntry, LogLevel, StatusCode } from "@/lib/cirrus/types";
 
 const LEVELS: LogLevel[] = ["debug", "info", "warn", "error"];
@@ -26,11 +29,26 @@ function codeLabel(c: StatusCode): string {
   return `${proto} ${c.value}`;
 }
 
+/** One plain-text log line for the clipboard, mirroring what a row shows. */
+function formatLogLine(l: LogEntry): string {
+  const time = new Date(l.ts).toLocaleTimeString(undefined, { hour12: false });
+  const parts = [
+    time,
+    LEVEL_TAG[l.level],
+    l.phase ? `[${l.phase}]` : null,
+    l.code ? `[${codeLabel(l.code)}]` : null,
+    l.connection ? `[${l.connection}]` : null,
+    l.message,
+  ].filter(Boolean);
+  return parts.join(" ");
+}
+
 export function DebugLogPanel() {
   const logs = useLogs();
   const [enabled, setEnabled] = useState(false);
   const [minLevel, setMinLevel] = useState<LogLevel>("info");
   const [phase, setPhase] = useState<string>(ALL_PHASES);
+  const [copied, setCopied] = useState(false);
 
   // Phases actually present in the buffer — the filter is self-populating, so a
   // newly-added Phase (e.g. tls / passive) shows up here with no UI change.
@@ -49,6 +67,25 @@ export function DebugLogPanel() {
         .reverse(), // newest first
     [logs, minLevel, phase],
   );
+
+  // Copy the currently-filtered lines, oldest-first (natural reading order for a
+  // pasted log), so the clipboard matches what the active filters show.
+  const copyLogs = async () => {
+    if (filtered.length === 0) return;
+    const text = filtered
+      .slice()
+      .reverse()
+      .map(formatLogLine)
+      .join("\n");
+    try {
+      await writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+      toast.success("Copied log", `${filtered.length} line${filtered.length > 1 ? "s" : ""}`);
+    } catch (e) {
+      toast.error("Copy failed", errText(e));
+    }
+  };
 
   if (!enabled) {
     return (
@@ -99,6 +136,14 @@ export function DebugLogPanel() {
             </option>
           ))}
         </select>
+        <button
+          onClick={copyLogs}
+          disabled={filtered.length === 0}
+          title="Copy visible log to clipboard"
+          className="flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-foreground/10 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {copied ? <Check className="h-3 w-3 text-success" /> : <Copy className="h-3 w-3" />}
+        </button>
         <button
           onClick={clearLogs}
           title="Clear log"

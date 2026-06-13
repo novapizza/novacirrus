@@ -19,6 +19,7 @@ use suppaftp::{FtpError, Mode};
 use tauri::{AppHandle, Emitter};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 
 /// Project a `suppaftp::FtpError` onto the [`AppError`] IR. The FTP reply code
 /// (e.g. 530, 550) drives the category; `phase` says where we were.
@@ -47,25 +48,35 @@ fn ftp_err(connector: Connector, phase: Phase, e: &FtpError) -> Error {
     Error::App(err)
 }
 
-/// FTP / FTPS backend. Connections are opened per operation (FTP is stateful
-/// and chatty; pooling is a separate concern).
-pub struct FtpBackend<'a> {
-    pub c: &'a Connection,
-    pub s: &'a ConnectionSecret,
+/// FTP / FTPS backend over a single live control connection, reused across
+/// operations. FTP is a stateful, single-stream protocol, so the stream is
+/// serialized behind a `Mutex` — operations on one connection never overlap.
+pub struct FtpBackend {
+    c: Connection,
+    ftp: Mutex<AsyncRustlsFtpStream>,
+}
+
+impl FtpBackend {
+    /// Connect, authenticate, and set the data-connection mode — done once; the
+    /// control connection then stays open until `disconnect()` or a drop.
+    pub async fn connect(c: &Connection, s: &ConnectionSecret) -> Result<Self> {
+        let ftp = open(c, s).await?;
+        Ok(Self { c: c.clone(), ftp: Mutex::new(ftp) })
+    }
 }
 
 #[async_trait]
-impl Remote for FtpBackend<'_> {
+impl Remote for FtpBackend {
     fn caps(&self) -> Caps {
         Caps { multipart: false, resume: false, virtual_buckets: false }
     }
 
     async fn test(&self) -> Result<String> {
-        test(self.c, self.s).await
+        check(&mut *self.ftp.lock().await, &self.c).await
     }
 
     async fn list(&self, path: &str) -> Result<Vec<ObjectEntry>> {
-        list(self.c, self.s, path).await
+        list(&mut *self.ftp.lock().await, &self.c, path).await
     }
 
     async fn search(
@@ -75,7 +86,7 @@ impl Remote for FtpBackend<'_> {
         limit: usize,
         max_depth: usize,
     ) -> Result<Vec<ObjectEntry>> {
-        search(self.c, self.s, path, query, limit, max_depth).await
+        search(&mut *self.ftp.lock().await, &self.c, path, query, limit, max_depth).await
     }
 
     async fn download(
@@ -85,7 +96,7 @@ impl Remote for FtpBackend<'_> {
         dest: &Path,
         transfer_id: String,
     ) -> Result<()> {
-        download(app, self.c, self.s, remote, dest, transfer_id).await
+        download(&mut *self.ftp.lock().await, app, &self.c, remote, dest, transfer_id).await
     }
 
     async fn upload_file(
@@ -95,7 +106,7 @@ impl Remote for FtpBackend<'_> {
         remote: &str,
         transfer_id: String,
     ) -> Result<()> {
-        upload(app, self.c, self.s, src, remote, transfer_id).await
+        upload_file(&mut *self.ftp.lock().await, app, &self.c, src, remote, transfer_id).await
     }
 
     async fn upload_dir(
@@ -104,11 +115,16 @@ impl Remote for FtpBackend<'_> {
         remote_base: &str,
         files: &[(PathBuf, String)],
     ) -> Result<usize> {
-        upload_dir(app, self.c, self.s, remote_base, files).await
+        upload_dir(&mut *self.ftp.lock().await, app, &self.c, remote_base, files).await
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
-        delete(self.c, self.s, path).await
+        delete(&mut *self.ftp.lock().await, &self.c, path).await
+    }
+
+    async fn disconnect(&self) {
+        // Best-effort graceful QUIT; the socket closes on drop regardless.
+        let _ = self.ftp.lock().await.quit().await;
     }
 }
 
@@ -259,31 +275,32 @@ async fn open(c: &Connection, s: &ConnectionSecret) -> Result<AsyncRustlsFtpStre
     Ok(ftp)
 }
 
-pub async fn test(c: &Connection, s: &ConnectionSecret) -> Result<String> {
+/// Probe a live connection (used by the Test button and the pooled `test()`).
+pub async fn check(ftp: &mut AsyncRustlsFtpStream, c: &Connection) -> Result<String> {
     let connector: Connector = c.kind.into();
-    let mut ftp = open(c, s).await?;
     let pwd = ftp
         .pwd()
         .await
         .map_err(|e| ftp_err(connector, Phase::List, &e))?;
-    let _ = ftp.quit().await;
     Ok(format!("OK — connected, cwd={pwd}"))
 }
 
-pub async fn list(c: &Connection, s: &ConnectionSecret, path: &str) -> Result<Vec<ObjectEntry>> {
+pub async fn list(
+    ftp: &mut AsyncRustlsFtpStream,
+    c: &Connection,
+    path: &str,
+) -> Result<Vec<ObjectEntry>> {
     let connector: Connector = c.kind.into();
-    let mut ftp = open(c, s).await?;
     let target = if path.is_empty() { None } else { Some(path) };
     log_data_mode(c);
     let lines = ftp
         .list(target)
         .await
         .map_err(|e| ftp_err(connector, Phase::List, &e))?;
-    let _ = ftp.quit().await;
 
     let mut out = Vec::new();
     for line in lines {
-        if let Ok(f) = suppaftp::list::File::from_posix_line(&line) {
+        if let Ok(f) = suppaftp::list::ListParser::parse_posix(&line) {
             let name = f.name().to_string();
             if name == "." || name == ".." {
                 continue;
@@ -323,14 +340,13 @@ pub async fn list(c: &Connection, s: &ConnectionSecret, path: &str) -> Result<Ve
 /// contains `query` (case-insensitive). `name` is the path relative to `root`.
 /// Bounded by `max_depth` and `limit` — FTP is chatty, one round-trip per dir.
 pub async fn search(
+    ftp: &mut AsyncRustlsFtpStream,
     c: &Connection,
-    s: &ConnectionSecret,
     root: &str,
     query: &str,
     limit: usize,
     max_depth: usize,
 ) -> Result<Vec<ObjectEntry>> {
-    let mut ftp = open(c, s).await?;
     let needle = query.to_lowercase();
     let start = if root.is_empty() { "/".to_string() } else { root.to_string() };
 
@@ -345,7 +361,7 @@ pub async fn search(
             Err(_) => continue, // skip unreadable dirs rather than aborting
         };
         for line in lines {
-            let Ok(f) = suppaftp::list::File::from_posix_line(&line) else { continue };
+            let Ok(f) = suppaftp::list::ListParser::parse_posix(&line) else { continue };
             let name = f.name().to_string();
             if name == "." || name == ".." {
                 continue;
@@ -377,7 +393,6 @@ pub async fn search(
                     etag: None,
                 });
                 if out.len() >= limit {
-                    let _ = ftp.quit().await;
                     return Ok(out);
                 }
             }
@@ -386,21 +401,19 @@ pub async fn search(
             }
         }
     }
-    let _ = ftp.quit().await;
     Ok(out)
 }
 
 pub async fn download(
+    ftp: &mut AsyncRustlsFtpStream,
     app: &AppHandle,
     c: &Connection,
-    s: &ConnectionSecret,
     remote: &str,
     dest: &Path,
     transfer_id: String,
 ) -> Result<()> {
     let connector: Connector = c.kind.into();
     let res: Result<()> = async {
-        let mut ftp = open(c, s).await?;
         let total = ftp.size(remote).await.unwrap_or(0) as u64;
 
         let _ = app.emit(
@@ -447,7 +460,6 @@ pub async fn download(
         ftp.finalize_retr_stream(stream)
             .await
             .map_err(|e| ftp_err(connector, Phase::Transfer, &e))?;
-        let _ = ftp.quit().await;
         let _ = app.emit("transfer", TransferEvent::Done { id: transfer_id.clone() });
         Ok(())
     }
@@ -459,36 +471,32 @@ pub async fn download(
     res
 }
 
-pub async fn upload(
+pub async fn upload_file(
+    ftp: &mut AsyncRustlsFtpStream,
     app: &AppHandle,
     c: &Connection,
-    s: &ConnectionSecret,
     src: &Path,
     remote: &str,
     transfer_id: String,
 ) -> Result<()> {
     let connector: Connector = c.kind.into();
-    let mut ftp = open(c, s).await?;
     let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("upload").to_string();
     log_data_mode(c);
-    let r = put_file(&mut ftp, app, connector, src, remote, &name, transfer_id).await;
-    let _ = ftp.quit().await;
-    r
+    put_file(ftp, app, connector, src, remote, &name, transfer_id).await
 }
 
 /// Upload every file under `files` (abs path, path relative to the upload root)
 /// into `remote_base`, reusing one connection and creating remote dirs as needed.
 pub async fn upload_dir(
+    ftp: &mut AsyncRustlsFtpStream,
     app: &AppHandle,
     c: &Connection,
-    s: &ConnectionSecret,
     remote_base: &str,
     files: &[(PathBuf, String)],
 ) -> Result<usize> {
     let connector: Connector = c.kind.into();
-    let mut ftp = open(c, s).await?;
     let mut created: HashSet<String> = HashSet::new();
-    ensure_dir(&mut ftp, &mut created, remote_base).await;
+    ensure_dir(ftp, &mut created, remote_base).await;
 
     log_data_mode(c);
     let mut count = 0;
@@ -496,13 +504,12 @@ pub async fn upload_dir(
         let remote = join_remote(remote_base, rel);
         if let Some((parent, _)) = remote.rsplit_once('/') {
             if !parent.is_empty() {
-                ensure_dir(&mut ftp, &mut created, parent).await;
+                ensure_dir(ftp, &mut created, parent).await;
             }
         }
-        put_file(&mut ftp, app, connector, abs, &remote, rel, Uuid::new_v4().to_string()).await?;
+        put_file(ftp, app, connector, abs, &remote, rel, Uuid::new_v4().to_string()).await?;
         count += 1;
     }
-    let _ = ftp.quit().await;
     Ok(count)
 }
 
@@ -596,15 +603,13 @@ async fn put_file(
     res
 }
 
-pub async fn delete(c: &Connection, s: &ConnectionSecret, path: &str) -> Result<()> {
+pub async fn delete(ftp: &mut AsyncRustlsFtpStream, c: &Connection, path: &str) -> Result<()> {
     let connector: Connector = c.kind.into();
-    let mut ftp = open(c, s).await?;
     if ftp.rm(path).await.is_err() {
         ftp.rmdir(path)
             .await
             .map_err(|e| ftp_err(connector, Phase::Delete, &e))?;
     }
-    let _ = ftp.quit().await;
     Ok(())
 }
 
@@ -652,9 +657,10 @@ mod live {
         let c = conn(ConnectionKind::Ftps, "demo");
         let s = pw("password");
         // Exercises the explicit-FTPS AUTH TLS handshake against a real CA cert.
-        let msg = test(&c, &s).await.expect("FTPS connect should succeed");
+        let b = FtpBackend::connect(&c, &s).await.expect("FTPS connect should succeed");
+        let msg = b.test().await.expect("FTPS probe should succeed");
         assert!(msg.contains("OK"), "unexpected: {msg}");
-        let entries = list(&c, &s, "").await.expect("FTPS list should succeed");
+        let entries = b.list("").await.expect("FTPS list should succeed");
         assert!(!entries.is_empty(), "root listing should not be empty");
     }
 
@@ -662,9 +668,10 @@ mod live {
     #[ignore = "hits public test.rebex.net"]
     async fn ftps_wrong_password_is_auth() {
         ensure_crypto();
-        let err = test(&conn(ConnectionKind::Ftps, "demo"), &pw("definitely-wrong"))
+        let err = FtpBackend::connect(&conn(ConnectionKind::Ftps, "demo"), &pw("definitely-wrong"))
             .await
-            .unwrap_err();
+            .err()
+            .expect("auth should fail");
         let a = err.to_app();
         assert_eq!(a.category, ErrorCategory::Auth, "got {a:?}");
     }
@@ -673,9 +680,10 @@ mod live {
     #[ignore = "hits public test.rebex.net"]
     async fn ftp_plain_connect() {
         ensure_crypto();
-        let msg = test(&conn(ConnectionKind::Ftp, "demo"), &pw("password"))
+        let b = FtpBackend::connect(&conn(ConnectionKind::Ftp, "demo"), &pw("password"))
             .await
             .expect("plain FTP connect should succeed");
+        let msg = b.test().await.expect("plain FTP probe should succeed");
         assert!(msg.contains("OK"), "unexpected: {msg}");
     }
 }

@@ -129,12 +129,18 @@ pub(crate) fn needs_bucket(op: &str) -> Error {
 
 /// S3 / R2 / S3-compatible backend. Owns the bucket-vs-key path handling so the
 /// dispatcher stays protocol-agnostic.
-pub struct S3Backend<'a> {
-    pub c: &'a Connection,
-    pub s: &'a ConnectionSecret,
+pub struct S3Backend {
+    pub c: Connection,
+    pub s: ConnectionSecret,
 }
 
-impl S3Backend<'_> {
+impl S3Backend {
+    /// S3 is stateless (an HTTPS client is built per request), so "connecting"
+    /// just holds the credentials — there's no socket to keep open.
+    pub fn new(c: Connection, s: ConnectionSecret) -> Self {
+        Self { c, s }
+    }
+
     /// The connection's default bucket, if set to a non-empty value. The UI
     /// stores unset fields as "", so an empty string counts as "no bucket".
     fn configured_bucket(&self) -> Option<String> {
@@ -148,7 +154,7 @@ impl S3Backend<'_> {
 }
 
 #[async_trait]
-impl Remote for S3Backend<'_> {
+impl Remote for S3Backend {
     fn caps(&self) -> Caps {
         Caps {
             multipart: true,
@@ -162,7 +168,7 @@ impl Remote for S3Backend<'_> {
         // If a default bucket is configured, verify against it instead so such
         // tokens work; otherwise fall back to listing buckets.
         if let Some(bucket) = self.configured_bucket() {
-            let client = make_client(self.c, self.s).await?;
+            let client = make_client(&self.c, &self.s).await?;
             client
                 .list_objects_v2()
                 .bucket(&bucket)
@@ -172,7 +178,7 @@ impl Remote for S3Backend<'_> {
                 .map_err(|e| classify_s3(self.c.kind.into(), Phase::List, &e))?;
             return Ok(format!("OK — bucket \"{bucket}\" reachable"));
         }
-        let bs = list_buckets(self.c, self.s).await?;
+        let bs = list_buckets(&self.c, &self.s).await?;
         Ok(format!("OK — {} bucket(s)", bs.len()))
     }
 
@@ -192,7 +198,7 @@ impl Remote for S3Backend<'_> {
                     etag: None,
                 }]);
             }
-            let bs = list_buckets(self.c, self.s).await?;
+            let bs = list_buckets(&self.c, &self.s).await?;
             return Ok(bs
                 .into_iter()
                 .map(|b| ObjectEntry {
@@ -205,7 +211,7 @@ impl Remote for S3Backend<'_> {
                 })
                 .collect());
         }
-        list_objects(self.c, self.s, &bucket, &prefix).await
+        list_objects(&self.c, &self.s, &bucket, &prefix).await
     }
 
     async fn search(
@@ -219,7 +225,7 @@ impl Remote for S3Backend<'_> {
         if bucket.is_empty() {
             return Err(needs_bucket("S3 search"));
         }
-        search_objects(self.c, self.s, &bucket, &prefix, query, limit).await
+        search_objects(&self.c, &self.s, &bucket, &prefix, query, limit).await
     }
 
     async fn download(
@@ -233,7 +239,7 @@ impl Remote for S3Backend<'_> {
         if bucket.is_empty() {
             return Err(needs_bucket("S3 download"));
         }
-        download(app, self.c, self.s, &bucket, &key, dest, transfer_id).await
+        download(app, &self.c, &self.s, &bucket, &key, dest, transfer_id).await
     }
 
     async fn upload_file(
@@ -247,7 +253,7 @@ impl Remote for S3Backend<'_> {
         if bucket.is_empty() {
             return Err(needs_bucket("S3 upload"));
         }
-        upload(app, self.c, self.s, &bucket, &key, src, transfer_id).await
+        upload(app, &self.c, &self.s, &bucket, &key, src, transfer_id).await
     }
 
     async fn upload_dir(
@@ -260,7 +266,7 @@ impl Remote for S3Backend<'_> {
         if bucket.is_empty() {
             return Err(needs_bucket("S3 upload"));
         }
-        upload_dir(app, self.c, self.s, &bucket, &prefix, files).await
+        upload_dir(app, &self.c, &self.s, &bucket, &prefix, files).await
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
@@ -268,7 +274,7 @@ impl Remote for S3Backend<'_> {
         if bucket.is_empty() {
             return Err(needs_bucket("S3 delete"));
         }
-        delete_object(self.c, self.s, &bucket, &key).await
+        delete_object(&self.c, &self.s, &bucket, &key).await
     }
 }
 

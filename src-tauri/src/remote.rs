@@ -15,6 +15,7 @@ use crate::s3::ObjectEntry;
 use crate::{ftp, s3, sftp};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tauri::AppHandle;
 
 /// What a backend can do, so the dispatcher / UI can adapt instead of
@@ -79,74 +80,63 @@ pub trait Remote: Send + Sync {
     ) -> Result<usize>;
 
     async fn delete(&self, path: &str) -> Result<()>;
+
+    /// Gracefully close the underlying session, if any. Called when the user
+    /// disconnects or a throwaway (test) backend is done. Default: nothing —
+    /// dropping the backend closes the socket. FTP overrides to send QUIT.
+    async fn disconnect(&self) {}
 }
 
-/// The single dispatch point: pick the backend for this connection's kind.
-pub fn connect<'a>(c: &'a Connection, s: &'a ConnectionSecret) -> Box<dyn Remote + 'a> {
-    match c.kind {
+/// Establish a live backend for `c`. SFTP/FTP open and authenticate a real
+/// session here (the expensive handshake); S3 is stateless so this just wraps
+/// the credentials. The returned `Arc` is what the [`crate::session::SessionPool`]
+/// caches and reuses across operations.
+pub async fn open_backend(c: &Connection, s: &ConnectionSecret) -> Result<Arc<dyn Remote>> {
+    Ok(match c.kind {
         ConnectionKind::S3 | ConnectionKind::R2 | ConnectionKind::S3Compat => {
-            Box::new(s3::S3Backend { c, s })
+            Arc::new(s3::S3Backend::new(c.clone(), s.clone()))
         }
-        ConnectionKind::Sftp => Box::new(sftp::SftpBackend { c, s }),
-        ConnectionKind::Ftp | ConnectionKind::Ftps => Box::new(ftp::FtpBackend { c, s }),
-    }
+        ConnectionKind::Sftp => Arc::new(sftp::SftpBackend::connect(c, s).await?),
+        ConnectionKind::Ftp | ConnectionKind::Ftps => {
+            Arc::new(ftp::FtpBackend::connect(c, s).await?)
+        }
+    })
 }
 
-// --- Thin wrappers used by the command layer. Each just resolves the backend
-//     and forwards; no behavior of its own except the upload dir-vs-file split. ---
-
+/// Connectivity check for the "Test" button: open a throwaway session, probe it,
+/// then close. Never touches the pool — testing must not disturb a live session.
 pub async fn test(c: &Connection, s: &ConnectionSecret) -> Result<String> {
-    connect(c, s).test().await
+    let backend = open_backend(c, s).await?;
+    let result = backend.test().await;
+    backend.disconnect().await;
+    result
 }
 
-pub async fn list(c: &Connection, s: &ConnectionSecret, path: &str) -> Result<Vec<ObjectEntry>> {
-    connect(c, s).list(path).await
-}
-
-pub async fn search(
-    c: &Connection,
-    s: &ConnectionSecret,
-    path: &str,
-    query: &str,
-) -> Result<Vec<ObjectEntry>> {
+/// Recursive search with the app's standard bounds; empty query short-circuits.
+pub async fn search(backend: &dyn Remote, path: &str, query: &str) -> Result<Vec<ObjectEntry>> {
     const LIMIT: usize = 1000;
     const MAX_DEPTH: usize = 12;
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
-    connect(c, s).search(path, query, LIMIT, MAX_DEPTH).await
+    backend.search(path, query, LIMIT, MAX_DEPTH).await
 }
 
-pub async fn download(
-    app: &AppHandle,
-    c: &Connection,
-    s: &ConnectionSecret,
-    remote: &str,
-    dest: &Path,
-    transfer_id: String,
-) -> Result<()> {
-    connect(c, s).download(app, remote, dest, transfer_id).await
-}
-
+/// Upload a file or, if `src` is a directory, recurse into a folder upload —
+/// the one piece of dispatch behavior that isn't a straight method forward.
 pub async fn upload(
+    backend: &dyn Remote,
     app: &AppHandle,
-    c: &Connection,
-    s: &ConnectionSecret,
     src: &Path,
     remote: &str,
     transfer_id: String,
 ) -> Result<()> {
-    // A directory source means a recursive folder upload.
     if std::fs::metadata(src).map(|m| m.is_dir()).unwrap_or(false) {
         let files = collect_files_rel(src)?;
-        connect(c, s).upload_dir(app, remote, &files).await?;
+        backend.upload_dir(app, remote, &files).await?;
         return Ok(());
     }
-    connect(c, s).upload_file(app, src, remote, transfer_id).await
-}
-
-pub async fn delete(c: &Connection, s: &ConnectionSecret, path: &str) -> Result<()> {
-    connect(c, s).delete(path).await
+    backend.upload_file(app, src, remote, transfer_id).await
 }
 
 /// Walk `dir` recursively, returning (absolute path, path relative to `dir`
